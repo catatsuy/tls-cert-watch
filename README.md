@@ -19,7 +19,7 @@ OpenSSLの終了コード、TLS 1.3の接続成立と暗号スイート、`Verif
 
 ## 設定
 
-`targets.json` を実際の監視対象に書き換えてください。同梱の `example.com` は形式を示すサンプルであり、両鍵種別が取得できることを保証しません。
+`targets.json` には `catatsuy.org`、`www.catatsuy.org`、`blog.catatsuy.org`、`matw.co` を登録し、各ホストのRSA・ECDSAを検査します。対象を変更する場合は、次の形式で編集してください。
 
 ```json
 [

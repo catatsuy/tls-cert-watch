@@ -1,6 +1,18 @@
 [
   {
-    "host": "example.com",
+    "host": "catatsuy.org",
+    "key_types": ["RSA", "ECDSA"]
+  },
+  {
+    "host": "www.catatsuy.org",
+    "key_types": ["RSA", "ECDSA"]
+  },
+  {
+    "host": "blog.catatsuy.org",
+    "key_types": ["RSA", "ECDSA"]
+  },
+  {
+    "host": "matw.co",
     "key_types": ["RSA", "ECDSA"]
   }
 ]
