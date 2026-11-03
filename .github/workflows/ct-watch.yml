@@ -68,7 +68,7 @@ jobs:
           if [[ -f "$CT_STATE_FILE" ]]; then bash scripts/ct-state.sh save; fi
       - name: Preserve rate limits even when acquisition is incomplete
         if: always() && steps.runtime.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ct-runtime
           path: ${{ runner.temp }}/ct-runtime.json
