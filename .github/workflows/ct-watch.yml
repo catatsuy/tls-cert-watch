@@ -1,0 +1,52 @@
+name: CT certificate watch
+
+on:
+  schedule:
+    - cron: '37 * * * *'
+  workflow_dispatch:
+    inputs:
+      initialize:
+        description: 'Explicitly replace baseline without notifying existing issuances'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Initialization and monitoring share a lock. Do not cancel an in-flight Slack/save.
+concurrency:
+  group: ct-state
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Load state branch
+        env:
+          CT_INITIALIZE: ${{ inputs.initialize == true }}
+          CT_STATE_FILE: ${{ runner.temp }}/ct-state.json
+        run: bash scripts/ct-state.sh load
+      - name: Fetch all pages and notify
+        env:
+          CERTSPOTTER_API_KEY: ${{ secrets.CERTSPOTTER_API_KEY }}
+          NOTIFY_SLACK_TOKEN: ${{ secrets.NOTIFY_SLACK_TOKEN }}
+          NOTIFY_SLACK_CHANNEL_ID: ${{ secrets.NOTIFY_SLACK_CHANNEL_ID }}
+          CT_INITIALIZE: ${{ inputs.initialize == true }}
+        run: |
+          args=()
+          if [[ "$CT_INITIALIZE" == true ]]; then args=(-initialize); fi
+          go run ./cmd/ct-watch -state "$RUNNER_TEMP/ct-state.json" "${args[@]}"
+      - name: Persist acknowledged cursors
+        env:
+          CT_STATE_FILE: ${{ runner.temp }}/ct-state.json
+        run: bash scripts/ct-state.sh save
