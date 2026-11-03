@@ -2,6 +2,8 @@ name: Test
 
 on:
   push:
+    branches-ignore:
+      - ct-state
   pull_request:
 
 permissions:
