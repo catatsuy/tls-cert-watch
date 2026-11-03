@@ -1,1 +1,13 @@
-{"version":0,"domains":{}}
+{
+  "version": 1,
+  "domains": {
+    "catatsuy.org": {
+      "after": "18143099869",
+      "include_subdomains": true
+    },
+    "matw.co": {
+      "after": "18143100919",
+      "include_subdomains": true
+    }
+  }
+}
