@@ -1,0 +1,45 @@
+name: TLS certificate watch
+
+on:
+  schedule:
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install OpenSSL and CA certificates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl ca-certificates
+          openssl version
+      - name: Install notify_slack v0.5.16
+        shell: bash
+        run: |
+          set -euo pipefail
+          work_dir=$(mktemp -d)
+          trap 'rm -rf "$work_dir"' EXIT
+          curl --fail --silent --show-error --location --retry 3 \
+            --connect-timeout 10 --max-time 60 \
+            https://github.com/catatsuy/notify_slack/releases/download/v0.5.16/notify_slack-linux-amd64.tar.gz \
+            -o "$work_dir/notify_slack.tar.gz"
+          echo "09d64fc0e56e0341653fc50f7fe2df94c946d58aebe1b35afc5d981701c71349  $work_dir/notify_slack.tar.gz" | sha256sum --check
+          tar -xzf "$work_dir/notify_slack.tar.gz" -C "$work_dir"
+          mkdir -p "$RUNNER_TEMP/tls-cert-watch-bin"
+          install -m 755 "$work_dir/notify_slack" "$RUNNER_TEMP/tls-cert-watch-bin/notify_slack"
+          echo "$RUNNER_TEMP/tls-cert-watch-bin" >> "$GITHUB_PATH"
+      - name: Check certificates and notify on failure
+        env:
+          NOTIFY_SLACK_TOKEN: ${{ secrets.NOTIFY_SLACK_TOKEN }}
+          NOTIFY_SLACK_CHANNEL_ID: ${{ secrets.NOTIFY_SLACK_CHANNEL_ID }}
+        run: go run . -config targets.json
