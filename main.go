@@ -7,46 +7,37 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
-	"os/exec"
-	"strings"
 	"time"
 )
 
 type notifier func(context.Context, string) error
 
-func slackNotifier(binary string, timeout time.Duration) notifier {
+func slackNotifier(timeout time.Duration) notifier {
 	return func(ctx context.Context, message string) error {
-		if os.Getenv("NOTIFY_SLACK_TOKEN") == "" || os.Getenv("NOTIFY_SLACK_CHANNEL_ID") == "" {
+		token, channel := os.Getenv("NOTIFY_SLACK_TOKEN"), os.Getenv("NOTIFY_SLACK_CHANNEL_ID")
+		if token == "" || channel == "" {
 			return errors.New("NOTIFY_SLACK_TOKEN and NOTIFY_SLACK_CHANNEL_ID are required")
 		}
 		child, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		cmd := exec.CommandContext(child, binary, "-c", "/dev/null", "-snippet", "-snippet-type", "text", "-filename", "tls-cert-watch.txt")
-		cmd.Stdin = strings.NewReader(message)
-		// Do not expose third-party CLI output, which might contain credentials.
-		if err := cmd.Run(); err != nil {
-			if child.Err() != nil {
-				return fmt.Errorf("notify_slack: %w", child.Err())
-			}
-			return fmt.Errorf("notify_slack failed: %w", err)
-		}
-		return nil
+		return postSlackMessage(child, http.DefaultClient, token, channel, message)
 	}
 }
 
 func report(ctx context.Context, results []Result, log io.Writer, notify notifier) error {
-	var failures []string
+	var failures []Result
 	for _, r := range results {
 		fmt.Fprintln(log, r.String())
 		if len(r.Problems) > 0 {
-			failures = append(failures, r.String())
+			failures = append(failures, r)
 		}
 	}
 	if len(failures) == 0 {
 		return nil
 	}
-	message := "tls-cert-watch: TLS証明書監視で異常を検出\n\n" + strings.Join(failures, "\n\n")
+	message := formatAlert(failures, len(results))
 	err := notify(ctx, message)
 	if err != nil {
 		return fmt.Errorf("%d checks failed; Slack通知失敗: %w", len(failures), err)
@@ -61,7 +52,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	openssl := flags.String("openssl", "openssl", "OpenSSL executable (OpenSSL 3 recommended)")
 	timeout := flags.Duration("timeout", 20*time.Second, "timeout per TLS connection")
 	notifyTimeout := flags.Duration("notify-timeout", 60*time.Second, "Slack notification timeout")
-	notifyBinary := flags.String("notify-slack", "notify_slack", "notify_slack executable")
 	caFile := flags.String("ca-file", "", "optional PEM CA bundle (OpenSSL and Go)")
 	noSlack := flags.Bool("no-slack", false, "local checks only; failures still exit nonzero")
 	if err := flags.Parse(args); err != nil {
@@ -73,7 +63,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if *timeout <= 0 || *notifyTimeout <= 0 {
 		return errors.New("timeouts must be positive")
 	}
-	notify := slackNotifier(*notifyBinary, *notifyTimeout)
+	notify := slackNotifier(*notifyTimeout)
 	if *noSlack {
 		notify = func(context.Context, string) error {
 			fmt.Fprintln(stderr, "Slack通知を無効化しています (-no-slack)")
@@ -83,7 +73,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	// Setup errors also attempt notification: an invalid config must not silently
 	// disable monitoring. Keep this separate from report to avoid double posting.
 	setupError := func(err error) error {
-		if e := notify(ctx, "tls-cert-watch: 監視開始失敗: "+err.Error()); e != nil {
+		if e := notify(ctx, "*TLS証明書の監視を開始できませんでした*\n"+escapeSlack(err.Error())+"\n設定とActionsの実行ログを確認してください。"); e != nil {
 			return errors.Join(err, e)
 		}
 		return err

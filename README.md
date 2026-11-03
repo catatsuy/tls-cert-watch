@@ -65,7 +65,7 @@ go build -o tls-cert-watch .
   -openssl /opt/homebrew/opt/openssl@3/bin/openssl
 ```
 
-Slack通知には [notify_slack](https://github.com/catatsuy/notify_slack) を使用します。[v0.5.16のRelease](https://github.com/catatsuy/notify_slack/releases/tag/v0.5.16) からOS・CPUに対応するバイナリを取得し、PATHに配置してください。
+Slack通知はGoの標準ライブラリからSlackの `chat.postMessage` APIを直接呼び出します。追加の通知CLIは不要です。既存のSecrets・環境変数名はそのまま使います。
 
 ```sh
 export NOTIFY_SLACK_TOKEN='...'
@@ -80,19 +80,41 @@ export NOTIFY_SLACK_CHANNEL_ID='...'
 | `-config` | `targets.json` | 設定ファイル |
 | `-openssl` | `openssl` | OpenSSLの実行ファイル |
 | `-timeout` | `20s` | 1検査のタイムアウト |
-| `-notify-slack` | `notify_slack` | 通知CLIの実行ファイル |
 | `-notify-timeout` | `1m` | 集約通知のタイムアウト |
 | `-ca-file` | 未指定 | 独自CAのPEMファイル |
 | `-no-slack` | false | ローカル検査用に通知を省略 |
 
-異常がある場合だけ、全対象の異常を1つのテキストファイルとして `notify_slack -c /dev/null -snippet -snippet-type text` に渡します。ホスト名、RSA/ECDSA、異常内容、有効期限、残り時間を含みます。設定読み込み失敗など、監視を開始できない場合も通知を試みます。認証情報はコマンド引数やログに出しません。
+異常がある場合だけ、全対象の異常を `@channel` メンション付きの1メッセージにまとめて投稿します。正常な検査結果は実行ログに記録します。通知例：
 
-通知完了を待ってから異常終了します。通知CLIの不在、Secrets未設定、Slackへの投稿失敗・タイムアウトも終了コード1です。正常時には通知CLIやSlack認証情報は不要です。状態を持たないため、異常が続く限り実行ごとに通知します。
+```text
+@channel
+TLS証明書の監視で問題を検出しました
+検査 8件中 2件に問題があります。
+証明書の自動更新・配信設定を確認してください。
+
+⚠️ 警告 — catatsuy.org:443 / RSA
+有効期限: 2026-11-04 12:00:00 UTC
+残り時間: 36時間20分0秒
+問題:
+• 有効期限まで48時間未満
+
+🚨 異常 — blog.catatsuy.org:443 / ECDSA
+有効期限: 不明（証明書を取得できませんでした）
+残り時間: 不明
+問題:
+• OpenSSL実行/TLS接続失敗: context deadline exceeded
+• TLS 1.3ハンドシェイク成功を確認できない
+• 証明書が取得できない
+```
+
+有効期限はUTCで表示し、期限切れの場合は経過時間を表示します。OpenSSLの生の診断出力は実行ログに残します。通知中の長いエラーは省略表示し、Slackの文字数制限を超える多数の異常は省略件数を明示します。全件の詳細は実行ログで確認できます。設定読み込み失敗など、監視を開始できない場合も `@channel` 付きで通知します。認証情報やAPIレスポンス本文はログに出しません。
+
+通知完了を待ってから異常終了します。Secrets未設定、HTTPエラー、Slack APIの `ok: false`、通知のタイムアウトも終了コード1です。正常時にはSlack認証情報は不要です。状態を持たないため、異常が続く限り実行ごとにメンション付きで通知します。
 
 ## GitHub Actions
 
 1. `targets.json` を実際の監視対象に更新してデフォルトブランチへ反映します。
-2. Slack AppのBot Tokenに `files:write` を付与し、ワークスペースへインストールして投稿先チャンネルへ招待します。
+2. Slack AppのBot Tokenに `chat:write` を付与し、ワークスペースへインストールして投稿先チャンネルへ招待します。既存のAppに `chat:write` を追加した場合は、Appを再インストールして権限を反映してください。ファイル投稿用の `files:write` は不要です（他のツールでも使っているAppでは、そのツールの必要権限を残してください）。
 3. リポジトリの **Settings → Secrets and variables → Actions** に次のSecretsを登録します。
 
 | Secret | 内容 |
@@ -102,11 +124,11 @@ export NOTIFY_SLACK_CHANNEL_ID='...'
 
 `.github/workflows/watch.yml` はUbuntu runnerで、UTCの00:17 / 03:17 / 06:17 / 09:17 / 12:17 / 15:17 / 18:17 / 21:17（日本時間も3時間ごとの17分）に実行します。Actionsタブの **TLS certificate watch → Run workflow** で手動実行できます。
 
-OpenSSLとCA証明書をインストールし、バージョンとSHA-256を固定した `notify_slack` を配置します。権限は `contents: read` だけで、GitHubへの書き込みや状態用ブランチ、DB、Heartbeat、他の監視サービスは不要です。ジョブ全体のタイムアウトは15分、通常の1検査は20秒です。対象を大量に追加する場合は検査数とタイムアウトの合計がジョブ上限内に収まるよう調整してください。ジョブ上限による強制終了やrunner/ツール準備自体の障害では、CLIからのSlack通知まで到達できない場合があります。
+OpenSSLとCA証明書をインストールし、Goから検査とSlack通知を実行します。権限は `contents: read` だけで、GitHubへの書き込みや状態用ブランチ、DB、Heartbeat、他の監視サービスは不要です。ジョブ全体のタイムアウトは15分、通常の1検査は20秒です。対象を大量に追加する場合は検査数とタイムアウトの合計がジョブ上限内に収まるよう調整してください。ジョブ上限による強制終了やrunner/ツール準備自体の障害では、CLIからのSlack通知まで到達できない場合があります。
 
 GitHub Actionsの定期実行には遅延や実行漏れの可能性があります。定期実行はデフォルトブランチ上で動作し、公開リポジトリは長期間の操作がないとスケジュールが無効になる場合もあります。Actionsの実行履歴とスケジュールの有効状態を定期的に確認してください。厳密な3時間間隔の実行を保証する仕組みではありません。
 
-通知方式は [rss-curator](https://github.com/catatsuy/rss-curator) を参考にしています。
+通知方式は [rss-curator](https://github.com/catatsuy/rss-curator) を参考にしています。`@channel` はSlackの [メンション記法](https://docs.slack.dev/messaging/formatting-message-text/#special-mentions) を使用します。実際の通知はSlack側の権限・チャンネルや受信者の通知設定にも従います。
 
 ## 開発・テスト
 

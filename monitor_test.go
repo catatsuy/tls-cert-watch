@@ -208,12 +208,12 @@ func TestMultipleHostsAndNotification(t *testing.T) {
 	calls := 0
 	notify := func(_ context.Context, message string) error {
 		calls++
-		for _, s := range []string{"bad.test", "RSA", "ECDSA", "expires=", "remaining="} {
+		for _, s := range []string{"bad.test", "RSA", "ECDSA", "有効期限:", "残り時間:"} {
 			if !strings.Contains(message, s) {
 				t.Errorf("missing %s", s)
 			}
 		}
-		if strings.Contains(message, "host=good.test") {
+		if strings.Contains(message, " — good.test:") {
 			t.Error("healthy host notified")
 		}
 		return nil
