@@ -16,7 +16,8 @@ func fixture(t *testing.T, handler http.HandlerFunc) (*Client, *[]time.Duration)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	var waits []time.Duration
-	return &Client{HTTP: server.Client(), Endpoint: server.URL, Key: "secret", Wait: func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }}, &waits
+	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	return &Client{Now: func() time.Time { return now }, HTTP: server.Client(), Endpoint: server.URL, Key: "secret", Wait: func(_ context.Context, d time.Duration) error { waits = append(waits, d); now = now.Add(d); return nil }}, &waits
 }
 func event(id string) string {
 	return fmt.Sprintf(`{"id":%q,"dns_names":["<@evil>&"],"issuer":{"friendly_name":"CA"},"pubkey":{"type":"ecdsa","curve":"P-384"},"not_before":"2020-01-01T00:00:00Z","not_after":"2020-02-01T00:00:00Z","cert_sha256":"abcd"}`, id)
@@ -197,8 +198,11 @@ func TestEmptyBaselineAndRecovery(t *testing.T) {
 	if e != nil || !changed || s.Domains["example.com"].After != "" || !s.Domains["example.com"].Subdomains {
 		t.Fatal(s, e)
 	}
-	if len(*waits) != 4 || (*waits)[1] != 700*time.Second || (*waits)[3] != 10*time.Second {
+	if len(*waits) != 3 || (*waits)[1] != 700*time.Second {
 		t.Fatal(*waits)
+	}
+	if c.PollUntil["example.com"].Sub(c.now()) != 10*time.Second {
+		t.Fatal(c.PollUntil)
 	}
 	path := t.TempDir() + "/state.json"
 	if e = Save(path, s); e != nil {
@@ -223,5 +227,58 @@ func TestMessageTooLarge(t *testing.T) {
 	_, changed, e := Process(context.Background(), c, target, baseline(), false, func(context.Context, string) error { t.Fatal("oversize notified"); return nil })
 	if e == nil || changed {
 		t.Fatal(e)
+	}
+}
+
+func TestEmptyPageEndsImmediatelyAndNextRunWaits(t *testing.T) {
+	c, waits := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "3600")
+		fmt.Fprint(w, "[]")
+	})
+	path := t.TempDir() + "/poll.json"
+	c.SavePoll = func(p map[string]time.Time) error { return Save(path, p) }
+	if _, e := c.Fetch(context.Background(), target[0], "old"); e != nil {
+		t.Fatal(e)
+	}
+	if len(*waits) != 1 || (*waits)[0] != 361*time.Second {
+		t.Fatalf("completion slept: %v", *waits)
+	}
+	var poll map[string]time.Time
+	if e := Load(path, &poll); e != nil {
+		t.Fatal(e)
+	}
+	next, nextWaits := fixture(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "[]") })
+	next.PollUntil = poll
+	start := c.now()
+	next.Now = func() time.Time { return start }
+	next.Wait = func(_ context.Context, d time.Duration) error {
+		*nextWaits = append(*nextWaits, d)
+		start = start.Add(d)
+		return nil
+	}
+	if _, e := next.Fetch(context.Background(), target[0], "old"); e != nil {
+		t.Fatal(e)
+	}
+	var total time.Duration
+	for _, d := range *nextWaits {
+		total += d
+	}
+	if total != time.Hour {
+		t.Fatalf("next run waited %s", total)
+	}
+}
+func TestPollSaveFailureDoesNotAdvance(t *testing.T) {
+	c, _ := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("after") == "old" {
+			fmt.Fprint(w, "["+event("new")+"]")
+		} else {
+			w.Header().Set("Retry-After", "3600")
+			fmt.Fprint(w, "[]")
+		}
+	})
+	c.SavePoll = func(map[string]time.Time) error { return errors.New("disk full") }
+	s, changed, e := Process(context.Background(), c, target, baseline(), false, func(context.Context, string) error { t.Fatal("notified before metadata saved"); return nil })
+	if e == nil || changed || s.Domains["example.com"].After != "old" {
+		t.Fatal(s, e)
 	}
 }

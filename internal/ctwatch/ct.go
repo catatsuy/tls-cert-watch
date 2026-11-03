@@ -46,6 +46,43 @@ type Client struct {
 	HTTP          *http.Client
 	Endpoint, Key string
 	Wait          func(context.Context, time.Duration) error
+	Log           io.Writer
+	PollUntil     map[string]time.Time
+	SavePoll      func(map[string]time.Time) error
+	Now           func() time.Time
+}
+
+// Poll deadlines are operational metadata, independent of issuance cursors.
+func (c *Client) now() time.Time {
+	if c.Now != nil {
+		return c.Now()
+	}
+	return time.Now()
+}
+func (c *Client) cooldown(t Target, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	if c.PollUntil == nil {
+		c.PollUntil = map[string]time.Time{}
+	}
+	c.PollUntil[t.Domain] = c.now().Add(d)
+	c.logf("domain=%s next request not before %s", t.Domain, c.PollUntil[t.Domain].UTC().Format(time.RFC3339))
+	if c.SavePoll != nil {
+		return c.SavePoll(c.PollUntil)
+	}
+	return nil
+}
+
+func (c *Client) logf(format string, args ...any) {
+	if c.Log != nil {
+		fmt.Fprintf(c.Log, "CT: "+format+"\n", args...)
+	}
+}
+
+func (c *Client) wait(ctx context.Context, t Target, d time.Duration, reason string) error {
+	c.logf("domain=%s waiting=%s reason=%s", t.Domain, d, reason)
+	return c.Wait(ctx, d)
 }
 
 func Sleep(ctx context.Context, d time.Duration) error {
@@ -89,8 +126,13 @@ func (c *Client) page(ctx context.Context, t Target, after string) ([]Issuance, 
 		if t.Subdomains {
 			pace = 361 * time.Second
 		}
-		if e := c.Wait(ctx, pace); e != nil {
+		if e := c.wait(ctx, t, pace, "Small plan request pacing"); e != nil {
 			return nil, e
+		}
+		if until := c.PollUntil[t.Domain]; until.After(c.now()) {
+			if e := c.wait(ctx, t, until.Sub(c.now()), "previous response Retry-After"); e != nil {
+				return nil, e
+			}
 		}
 		req, e := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 		if e != nil {
@@ -99,29 +141,29 @@ func (c *Client) page(ctx context.Context, t Target, after string) ([]Issuance, 
 		req.Header.Set("Authorization", "Bearer "+c.Key)
 		safe := *c.HTTP
 		safe.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		c.logf("domain=%s requesting page attempt=%d", t.Domain, attempt+1)
 		res, e := safe.Do(req)
 		if e != nil {
 			if attempt == 3 {
 				return nil, errors.New("CT HTTP request failed")
 			}
-			if e = c.Wait(ctx, time.Second<<attempt); e != nil {
+			if e = c.wait(ctx, t, time.Second<<attempt, "network retry backoff"); e != nil {
 				return nil, e
 			}
 			continue
 		}
+		c.logf("domain=%s HTTP status=%d", t.Domain, res.StatusCode)
 		delay := retryDelay(res.Header.Get("Retry-After"))
 		data, readErr := io.ReadAll(io.LimitReader(res.Body, 8*1024*1024+1))
 		res.Body.Close()
 		if res.StatusCode == 429 || res.StatusCode >= 500 {
+			if e = c.cooldown(t, max(delay, time.Second<<attempt)); e != nil {
+				return nil, e
+			}
 			if attempt == 3 {
-				// Keep the serialized workflow occupied through the server cooldown,
-				// including when another scheduled run is already queued.
-				if e = c.Wait(ctx, max(delay, time.Second<<attempt)); e != nil {
-					return nil, e
-				}
 				return nil, fmt.Errorf("CT HTTP %d (retry exhausted)", res.StatusCode)
 			}
-			if e = c.Wait(ctx, max(delay, time.Second<<attempt)); e != nil {
+			if e = c.wait(ctx, t, max(delay, time.Second<<attempt), "HTTP retry backoff / Retry-After"); e != nil {
 				return nil, e
 			}
 			continue
@@ -136,9 +178,10 @@ func (c *Client) page(ctx context.Context, t Target, after string) ([]Issuance, 
 		if e = json.Unmarshal(data, &page); e != nil || page == nil {
 			return nil, errors.New("CT invalid JSON array")
 		}
-		// Honor empty-page polling delay before another run can use this cursor.
-		if len(page) == 0 && delay > 0 {
-			if e = c.Wait(ctx, delay); e != nil {
+		c.logf("domain=%s page issuances=%d", t.Domain, len(page))
+		// Completion does not require sleeping. The next run honors this deadline.
+		if len(page) == 0 {
+			if e = c.cooldown(t, delay); e != nil {
 				return nil, e
 			}
 		}
@@ -147,6 +190,7 @@ func (c *Client) page(ctx context.Context, t Target, after string) ([]Issuance, 
 	return nil, errors.New("CT retries exhausted")
 }
 func (c *Client) Fetch(ctx context.Context, t Target, after string) ([]Issuance, error) {
+	c.logf("domain=%s fetching all pages", t.Domain)
 	var all []Issuance
 	seen := map[string]bool{}
 	if after != "" {
@@ -158,6 +202,7 @@ func (c *Client) Fetch(ctx context.Context, t Target, after string) ([]Issuance,
 			return nil, e
 		}
 		if len(p) == 0 {
+			c.logf("domain=%s pagination complete pages=%d issuances=%d", t.Domain, pages+1, len(all))
 			return all, nil
 		}
 		for _, v := range p {
@@ -281,7 +326,7 @@ func Notify(ctx context.Context, message string) error {
 	defer cancel()
 	return slack.PostMessage(child, &http.Client{Timeout: time.Minute}, token, channel, message)
 }
-func Save(path string, s State) error {
+func Save(path string, s any) error {
 	b, e := json.MarshalIndent(s, "", "  ")
 	if e != nil {
 		return e
