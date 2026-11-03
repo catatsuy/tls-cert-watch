@@ -31,9 +31,9 @@ case "$mode" in
     export GIT_AUTHOR_NAME='github-actions[bot]' GIT_COMMITTER_NAME='github-actions[bot]'
     export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
     if [[ -n "$parent" ]]; then
-      commit=$(git commit-tree "$tree" -p "$parent" -m 'Update CT issuance cursors')
+      commit=$(git commit-tree "$tree" -p "$parent" -m 'Update CT cursors or acquisition checkpoint')
     else
-      commit=$(git commit-tree "$tree" -m 'Initialize CT issuance cursors')
+      commit=$(git commit-tree "$tree" -m 'Create CT acquisition state')
     fi
     # Normal fast-forward push: never overwrite concurrent/out-of-band updates.
     git push origin "$commit:refs/heads/ct-state"

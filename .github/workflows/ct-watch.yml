@@ -25,29 +25,32 @@ jobs:
       contents: write
       actions: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: false
-      - name: Restore API polling deadlines
+      - name: Restore request budget and polling deadlines
+        id: runtime
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          artifact=$(gh api --method GET "repos/$GH_REPO/actions/artifacts" -f name=ct-poll-state -f per_page=1 --jq '.artifacts[0].id // empty')
+          artifact=$(gh api --method GET "repos/$GH_REPO/actions/artifacts" -f name=ct-runtime -f per_page=1 --jq '.artifacts[0].id // empty')
           if [[ -n "$artifact" ]]; then
-            gh api "repos/$GH_REPO/actions/artifacts/$artifact/zip" > "$RUNNER_TEMP/ct-poll.zip"
-            unzip -p "$RUNNER_TEMP/ct-poll.zip" ct-poll.json > "$RUNNER_TEMP/ct-poll.json"
+            gh api "repos/$GH_REPO/actions/artifacts/$artifact/zip" > "$RUNNER_TEMP/ct-runtime.zip"
+            unzip -p "$RUNNER_TEMP/ct-runtime.zip" ct-runtime.json > "$RUNNER_TEMP/ct-runtime.json"
           fi
       - name: Load state branch
+        id: state
         env:
           CT_INITIALIZE: ${{ inputs.initialize == true }}
           CT_STATE_FILE: ${{ runner.temp }}/ct-state.json
         run: bash scripts/ct-state.sh load
-      - name: Fetch all pages and notify
+      - name: Fetch pages, checkpoint, and notify on completion
+        id: fetch
         env:
           CERTSPOTTER_API_KEY: ${{ secrets.CERTSPOTTER_API_KEY }}
           NOTIFY_SLACK_TOKEN: ${{ secrets.NOTIFY_SLACK_TOKEN }}
@@ -56,17 +59,19 @@ jobs:
         run: |
           args=()
           if [[ "$CT_INITIALIZE" == true ]]; then args=(-initialize); fi
-          go run ./cmd/ct-watch -poll-state "$RUNNER_TEMP/ct-poll.json" -state "$RUNNER_TEMP/ct-state.json" "${args[@]}"
-      - name: Persist acknowledged cursors
+          go run ./cmd/ct-watch -runtime "$RUNNER_TEMP/ct-runtime.json" -state "$RUNNER_TEMP/ct-state.json" "${args[@]}"
+      - name: Persist acknowledged cursors or incomplete acquisition
+        if: always() && steps.state.outcome == 'success' && steps.fetch.outcome != 'skipped'
         env:
           CT_STATE_FILE: ${{ runner.temp }}/ct-state.json
-        run: bash scripts/ct-state.sh save
-      - name: Preserve polling deadlines even on API or Slack failure
-        if: always()
+        run: |
+          if [[ -f "$CT_STATE_FILE" ]]; then bash scripts/ct-state.sh save; fi
+      - name: Preserve rate limits even when acquisition is incomplete
+        if: always() && steps.runtime.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: ct-poll-state
-          path: ${{ runner.temp }}/ct-poll.json
+          name: ct-runtime
+          path: ${{ runner.temp }}/ct-runtime.json
           if-no-files-found: ignore
           overwrite: true
           retention-days: 90

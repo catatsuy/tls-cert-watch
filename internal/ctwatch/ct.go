@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ type Cursor struct {
 type State struct {
 	Version int               `json:"version"`
 	Domains map[string]Cursor `json:"domains"`
+	Pending *Batch            `json:"pending,omitempty"`
 }
 type Issuance struct {
 	ID       string   `json:"id"`
@@ -46,43 +48,10 @@ type Client struct {
 	HTTP          *http.Client
 	Endpoint, Key string
 	Wait          func(context.Context, time.Duration) error
-	Log           io.Writer
-	PollUntil     map[string]time.Time
-	SavePoll      func(map[string]time.Time) error
+	Runtime       *Runtime
+	SaveRuntime   func(*Runtime) error
 	Now           func() time.Time
-}
-
-// Poll deadlines are operational metadata, independent of issuance cursors.
-func (c *Client) now() time.Time {
-	if c.Now != nil {
-		return c.Now()
-	}
-	return time.Now()
-}
-func (c *Client) cooldown(t Target, d time.Duration) error {
-	if d <= 0 {
-		return nil
-	}
-	if c.PollUntil == nil {
-		c.PollUntil = map[string]time.Time{}
-	}
-	c.PollUntil[t.Domain] = c.now().Add(d)
-	c.logf("domain=%s next request not before %s", t.Domain, c.PollUntil[t.Domain].UTC().Format(time.RFC3339))
-	if c.SavePoll != nil {
-		return c.SavePoll(c.PollUntil)
-	}
-	return nil
-}
-
-func (c *Client) logf(format string, args ...any) {
-	if c.Log != nil {
-		fmt.Fprintf(c.Log, "CT: "+format+"\n", args...)
-	}
-}
-
-func (c *Client) wait(ctx context.Context, t Target, d time.Duration, reason string) error {
-	c.logf("domain=%s waiting=%s reason=%s", t.Domain, d, reason)
-	return c.Wait(ctx, d)
+	Log           io.Writer
 }
 
 func Sleep(ctx context.Context, d time.Duration) error {
@@ -121,18 +90,8 @@ func (c *Client) page(ctx context.Context, t Target, after string) ([]Issuance, 
 	}
 	u.RawQuery = q.Encode()
 	for attempt := 0; attempt < 4; attempt++ {
-		// Waiting before EVERY request also bounds usage across serialized workflow runs.
-		pace := 41 * time.Second
-		if t.Subdomains {
-			pace = 361 * time.Second
-		}
-		if e := c.wait(ctx, t, pace, "Small plan request pacing"); e != nil {
+		if e := c.beforeRequest(ctx, t); e != nil {
 			return nil, e
-		}
-		if until := c.PollUntil[t.Domain]; until.After(c.now()) {
-			if e := c.wait(ctx, t, until.Sub(c.now()), "previous response Retry-After"); e != nil {
-				return nil, e
-			}
 		}
 		req, e := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 		if e != nil {
@@ -147,24 +106,25 @@ func (c *Client) page(ctx context.Context, t Target, after string) ([]Issuance, 
 			if attempt == 3 {
 				return nil, errors.New("CT HTTP request failed")
 			}
-			if e = c.wait(ctx, t, time.Second<<attempt, "network retry backoff"); e != nil {
+			if e = c.Wait(ctx, time.Second<<attempt); e != nil {
 				return nil, e
 			}
 			continue
 		}
-		c.logf("domain=%s HTTP status=%d", t.Domain, res.StatusCode)
 		delay := retryDelay(res.Header.Get("Retry-After"))
 		data, readErr := io.ReadAll(io.LimitReader(res.Body, 8*1024*1024+1))
 		res.Body.Close()
+		c.logf("domain=%s HTTP=%d", t.Domain, res.StatusCode)
 		if res.StatusCode == 429 || res.StatusCode >= 500 {
-			if e = c.cooldown(t, max(delay, time.Second<<attempt)); e != nil {
+			delay = max(delay, time.Second<<attempt)
+			if e = c.deferRequest(t, delay, res.StatusCode == 429); e != nil {
 				return nil, e
 			}
-			if attempt == 3 {
-				return nil, fmt.Errorf("CT HTTP %d (retry exhausted)", res.StatusCode)
+			if res.StatusCode == 429 {
+				return nil, fmt.Errorf("CT HTTP 429: %w", ErrDeferred)
 			}
-			if e = c.wait(ctx, t, max(delay, time.Second<<attempt), "HTTP retry backoff / Retry-After"); e != nil {
-				return nil, e
+			if attempt == 3 || delay > 5*time.Second {
+				return nil, fmt.Errorf("CT HTTP %d; resume next run", res.StatusCode)
 			}
 			continue
 		}
@@ -178,53 +138,71 @@ func (c *Client) page(ctx context.Context, t Target, after string) ([]Issuance, 
 		if e = json.Unmarshal(data, &page); e != nil || page == nil {
 			return nil, errors.New("CT invalid JSON array")
 		}
-		c.logf("domain=%s page issuances=%d", t.Domain, len(page))
-		// Completion does not require sleeping. The next run honors this deadline.
 		if len(page) == 0 {
-			if e = c.cooldown(t, delay); e != nil {
+			if e = c.deferRequest(t, delay, false); e != nil {
 				return nil, e
 			}
 		}
+		c.logf("domain=%s received=%d", t.Domain, len(page))
 		return page, nil
 	}
 	return nil, errors.New("CT retries exhausted")
 }
 func (c *Client) Fetch(ctx context.Context, t Target, after string) ([]Issuance, error) {
-	c.logf("domain=%s fetching all pages", t.Domain)
-	var all []Issuance
-	seen := map[string]bool{}
-	if after != "" {
-		seen[after] = true
+	p := &Progress{After: after}
+	if e := c.fetchProgress(ctx, t, p); e != nil {
+		return nil, e
 	}
-	for pages := 0; pages < 1000; pages++ {
-		p, e := c.page(ctx, t, after)
+	return p.Items, nil
+}
+func (c *Client) fetchProgress(ctx context.Context, t Target, progress *Progress) error {
+	seen := map[string]bool{}
+	if progress.After != "" {
+		seen[progress.After] = true
+	}
+	for _, v := range progress.Items {
+		seen[v.ID] = true
+	}
+	for !progress.Complete {
+		if progress.Pages >= 1000 {
+			return errors.New("CT pagination limit reached")
+		}
+		p, e := c.page(ctx, t, progress.After)
 		if e != nil {
-			return nil, e
+			return e
 		}
 		if len(p) == 0 {
-			c.logf("domain=%s pagination complete pages=%d issuances=%d", t.Domain, pages+1, len(all))
-			return all, nil
+			progress.Complete = true
+			c.logf("domain=%s complete issuances=%d", t.Domain, len(progress.Items))
+			return nil
+		}
+		// Validate the entire page before adding it to the durable checkpoint.
+		pageSeen := map[string]bool{}
+		for _, v := range p {
+			if v.ID == "" || seen[v.ID] || pageSeen[v.ID] {
+				return errors.New("CT missing/repeated issuance id")
+			}
+			pageSeen[v.ID] = true
+			if len(v.DNSNames) == 0 || v.Issuer.Name == "" || v.Pubkey.Type == "" || v.Fingerprint == "" {
+				return errors.New("CT missing certificate information")
+			}
+			if _, e = time.Parse(time.RFC3339, v.NotBefore); e != nil {
+				return errors.New("CT invalid not_before")
+			}
+			if _, e = time.Parse(time.RFC3339, v.NotAfter); e != nil {
+				return errors.New("CT invalid not_after")
+			}
 		}
 		for _, v := range p {
-			if v.ID == "" || seen[v.ID] {
-				return nil, errors.New("CT missing/repeated issuance id")
-			}
-			if len(v.DNSNames) == 0 || v.Issuer.Name == "" || v.Pubkey.Type == "" || v.Fingerprint == "" {
-				return nil, errors.New("CT missing certificate information")
-			}
-			if _, e := time.Parse(time.RFC3339, v.NotBefore); e != nil {
-				return nil, errors.New("CT invalid not_before")
-			}
-			if _, e := time.Parse(time.RFC3339, v.NotAfter); e != nil {
-				return nil, errors.New("CT invalid not_after")
-			}
 			seen[v.ID] = true
-			all = append(all, v)
 		}
-		after = p[len(p)-1].ID
+		progress.Items = append(progress.Items, p...)
+		progress.After = p[len(p)-1].ID
+		progress.Pages++
 	}
-	return nil, errors.New("CT pagination limit reached; no cursor saved")
+	return nil
 }
+
 func Load(path string, v any) error {
 	b, e := os.ReadFile(path)
 	if e != nil {
@@ -276,47 +254,108 @@ func Message(t Target, v Issuance) string {
 	return fmt.Sprintf("\n\n対象: %s\n発行ID: %s\nSAN/CN: %s\nCA: %s\n公開鍵: %s\n発行日時 (NotBefore): %s\n期限: %s\nSHA-256: %s", Escape(t.Domain), Escape(v.ID), Escape(strings.Join(v.DNSNames, ", ")), Escape(v.Issuer.Name), Escape(key), Escape(v.NotBefore), Escape(v.NotAfter), Escape(v.Fingerprint))
 }
 
-// Process collects all domains before notifying and mutates state only after notification succeeds.
+// Process preserves partial acquisition separately from acknowledged cursors.
+// Only a complete, successfully notified batch advances those cursors.
 func Process(ctx context.Context, c *Client, ts []Target, s State, init bool, notify func(context.Context, string) error) (State, bool, error) {
-	if e := Validate(ts, s, init); e != nil {
+	if e := Validate(ts, State{}, true); e != nil {
 		return s, false, e
+	}
+	if s.Version != 0 && s.Version != 1 {
+		return s, false, errors.New("unsupported CT state version")
+	}
+
+	if s.Pending != nil {
+		if s.Pending.Domains == nil {
+			return s, false, errors.New("invalid CT pending domains")
+		}
+		known := map[string]bool{}
+		for _, t := range ts {
+			known[t.Domain] = true
+		}
+		for domain, p := range s.Pending.Domains {
+			if !known[domain] || p == nil || p.Pages < 0 || p.Pages > 1000 {
+				return s, false, errors.New("invalid CT progress")
+			}
+			seen := map[string]bool{}
+			for _, v := range p.Items {
+				if v.ID == "" || seen[v.ID] {
+					return s, false, errors.New("invalid CT pending issuance")
+				}
+				seen[v.ID] = true
+			}
+			if len(p.Items) > 0 && p.After != p.Items[len(p.Items)-1].ID {
+				return s, false, errors.New("invalid CT pending cursor")
+			}
+		}
+		if !reflect.DeepEqual(ts, s.Pending.Targets) {
+			return s, false, errors.New("CT targets changed during pending acquisition; restore matching config or explicitly recover state")
+		}
+		if init && !s.Pending.Initialize {
+			return s, false, errors.New("finish pending monitoring before reinitializing")
+		}
+		if !s.Pending.Initialize {
+			if e := Validate(ts, s, false); e != nil {
+				return s, false, e
+			}
+		}
+	} else {
+		if e := Validate(ts, s, init); e != nil {
+			return s, false, e
+		}
+	}
+	// Work on a copy: the acknowledged cursors stay unchanged on every failure.
+	data, _ := json.Marshal(s)
+	var working State
+	if e := json.Unmarshal(data, &working); e != nil {
+		return s, false, e
+	}
+	if working.Pending == nil {
+		working.Pending = &Batch{Initialize: init, Targets: ts, Domains: map[string]*Progress{}}
+	}
+	batch := working.Pending
+	for _, t := range ts {
+		p := batch.Domains[t.Domain]
+		if p == nil {
+			after := ""
+			if !batch.Initialize {
+				after = s.Domains[t.Domain].After
+			}
+			p = &Progress{After: after}
+			batch.Domains[t.Domain] = p
+		}
+		if e := c.fetchProgress(ctx, t, p); e != nil {
+			return working, false, fmt.Errorf("%s: %w", t.Domain, e)
+		}
 	}
 	next := State{Version: 1, Domains: map[string]Cursor{}}
 	for k, v := range s.Domains {
 		next.Domains[k] = v
 	}
-	changed := init
+	changed := batch.Initialize
 	message := "*CTログで新規証明書発行を検出しました*"
 	for _, t := range ts {
-		cur := s.Domains[t.Domain]
-		if init {
-			cur = Cursor{Subdomains: t.Subdomains}
+		p := batch.Domains[t.Domain]
+		next.Domains[t.Domain] = Cursor{After: p.After, Subdomains: t.Subdomains}
+		if len(p.Items) > 0 {
+			changed = true
 		}
-		items, e := c.Fetch(ctx, t, cur.After)
-		if e != nil {
-			return s, false, fmt.Errorf("%s: %w", t.Domain, e)
-		}
-		for _, v := range items {
-			cur.After = v.ID
-			if !init {
+		if !batch.Initialize {
+			for _, v := range p.Items {
 				message += Message(t, v)
 			}
 		}
-		next.Domains[t.Domain] = cur
-		if len(items) > 0 {
-			changed = true
-		}
 	}
-	if !init && changed {
+	if !batch.Initialize && changed {
 		if len([]rune(message)) > 35000 {
-			return s, false, errors.New("CT Slack message exceeds safe size; no cursor saved")
+			return working, false, errors.New("CT Slack message exceeds safe size; no cursor saved")
 		}
 		if e := notify(ctx, message); e != nil {
-			return s, false, e
+			return working, false, e
 		}
 	}
 	return next, changed, nil
 }
+
 func Notify(ctx context.Context, message string) error {
 	token, channel := os.Getenv("NOTIFY_SLACK_TOKEN"), os.Getenv("NOTIFY_SLACK_CHANNEL_ID")
 	if token == "" || channel == "" {
