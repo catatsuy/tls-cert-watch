@@ -9,5 +9,25 @@
       "after": "18143100919",
       "include_subdomains": true
     }
+  },
+  "pending": {
+    "initialize": false,
+    "targets": [
+      {
+        "domain": "catatsuy.org",
+        "include_subdomains": true
+      },
+      {
+        "domain": "matw.co",
+        "include_subdomains": true
+      }
+    ],
+    "domains": {
+      "catatsuy.org": {
+        "after": "18143099869",
+        "pages": 0,
+        "complete": false
+      }
+    }
   }
 }
