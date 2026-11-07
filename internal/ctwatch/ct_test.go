@@ -24,7 +24,7 @@ func event(id string) string {
 	return fmt.Sprintf(`{"id":%q,"dns_names":["<@evil>&"],"issuer":{"friendly_name":"CA"},"pubkey":{"type":"ecdsa","curve":"P-384"},"not_before":"2020-01-01T00:00:00Z","not_after":"2020-02-01T00:00:00Z","cert_sha256":"abcd"}`, id)
 }
 func baseline() State {
-	return State{Version: 1, Domains: map[string]Cursor{"example.com": {After: "old", Subdomains: true}}}
+	return State{Version: 2, Domains: map[string]Cursor{"example.com": {After: "old", Subdomains: true}}}
 }
 
 var target = []Target{{Domain: "example.com", Subdomains: true}}
@@ -198,7 +198,7 @@ func TestEmptyBaselineAndRecovery(t *testing.T) {
 		}
 	})
 	s, changed, e := Process(context.Background(), c, target, State{}, true, func(context.Context, string) error { t.Fatal("notified"); return nil })
-	if e == nil || changed || s.Version == 1 || s.Pending == nil {
+	if e == nil || changed || s.Version == 2 || s.Pending == nil {
 		t.Fatal(s, e)
 	}
 	now := c.now().Add(701 * time.Second)
@@ -398,5 +398,73 @@ func Test429ResumesLastSuccessfulPage(t *testing.T) {
 		if d > 5*time.Second {
 			t.Fatal("long wait", d)
 		}
+	}
+}
+
+func TestIssuerHistory(t *testing.T) {
+	s := baseline()
+	s.Domains["example.com"] = Cursor{After: "old", Subdomains: true, Issuers: []string{"CA"}}
+	c, _ := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("after") {
+		case "old":
+			fmt.Fprint(w, "["+event("known")+","+strings.ReplaceAll(event("new"), `"CA"`, `"New CA"`)+"]")
+		default:
+			fmt.Fprint(w, "[]")
+		}
+	})
+	notifications := 0
+	pending, _, err := Process(context.Background(), c, target, s, false, func(_ context.Context, message string) error {
+		notifications++
+		if strings.Contains(message, "発行ID: known") || !strings.Contains(message, "発行ID: new") {
+			t.Fatal(message)
+		}
+		return errors.New("Slack failed")
+	})
+	if err == nil || len(pending.Domains["example.com"].Issuers) != 1 || len(s.Domains["example.com"].Issuers) != 1 {
+		t.Fatal(pending, err)
+	}
+	next, changed, err := Process(context.Background(), c, target, pending, false, func(context.Context, string) error { notifications++; return nil })
+	if err != nil || !changed || notifications != 2 || len(next.Domains["example.com"].Issuers) != 2 {
+		t.Fatal(next, err)
+	}
+	// A later issuance from the newly learned CA advances the cursor silently.
+	c, _ = fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("after") == "new" {
+			fmt.Fprint(w, "["+strings.ReplaceAll(event("renewal"), `"CA"`, `"New CA"`)+"]")
+		} else {
+			fmt.Fprint(w, "[]")
+		}
+	})
+	next, changed, err = Process(context.Background(), c, target, next, false, func(context.Context, string) error { t.Fatal("known issuer notified"); return nil })
+	if err != nil || !changed || next.Domains["example.com"].After != "renewal" {
+		t.Fatal(next, err)
+	}
+	path := t.TempDir() + "/state.json"
+	if err = Save(path, next); err != nil {
+		t.Fatal(err)
+	}
+	var restored State
+	if err = Load(path, &restored); err != nil || len(restored.Domains["example.com"].Issuers) != 2 {
+		t.Fatal(restored, err)
+	}
+}
+
+func TestIssuerHistoryMigration(t *testing.T) {
+	c, _ := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("after") {
+		case "":
+			fmt.Fprint(w, "["+event("existing")+"]")
+		case "existing":
+			fmt.Fprint(w, "[]")
+		default:
+			t.Error("migration must fetch historical issuers")
+			fmt.Fprint(w, "[]")
+		}
+	})
+	s := baseline()
+	s.Version = 1
+	next, changed, err := Process(context.Background(), c, target, s, false, func(context.Context, string) error { t.Fatal("migration notified"); return nil })
+	if err != nil || !changed || next.Version != 2 || len(next.Domains["example.com"].Issuers) != 1 || next.Domains["example.com"].Issuers[0] != "CA" {
+		t.Fatal(next, err)
 	}
 }

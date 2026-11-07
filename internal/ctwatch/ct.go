@@ -21,8 +21,9 @@ type Target struct {
 	Subdomains bool   `json:"include_subdomains"`
 }
 type Cursor struct {
-	After      string `json:"after"`
-	Subdomains bool   `json:"include_subdomains"`
+	After      string   `json:"after"`
+	Issuers    []string `json:"issuers"`
+	Subdomains bool     `json:"include_subdomains"`
 }
 type State struct {
 	Version int               `json:"version"`
@@ -235,7 +236,7 @@ func Validate(ts []Target, s State, init bool) error {
 			}
 		}
 	}
-	if !init && (s.Version != 1 || s.Domains == nil) {
+	if !init && ((s.Version != 1 && s.Version != 2) || s.Domains == nil) {
 		return errors.New("invalid CT state")
 	}
 	return nil
@@ -260,8 +261,25 @@ func Process(ctx context.Context, c *Client, ts []Target, s State, init bool, no
 	if e := Validate(ts, State{}, true); e != nil {
 		return s, false, e
 	}
-	if s.Version != 0 && s.Version != 1 {
+	if s.Version != 0 && s.Version != 1 && s.Version != 2 {
 		return s, false, errors.New("unsupported CT state version")
+	}
+
+	// Version 1 stored only cursors. Rebuild issuer history from all available
+	// certificates without treating historical issuers as new alerts.
+	if s.Version == 1 {
+		if e := Validate(ts, s, init || s.Pending != nil && s.Pending.Initialize); e != nil {
+			return s, false, e
+		}
+		if s.Pending != nil && !reflect.DeepEqual(ts, s.Pending.Targets) {
+			return s, false, errors.New("CT targets changed during pending acquisition; restore matching config")
+		}
+		s.Version = 2
+		if s.Pending != nil && !s.Pending.Initialize {
+			s.Pending = nil
+		}
+		init = true
+		c.logf("building issuer history from existing certificates")
 	}
 
 	if s.Pending != nil {
@@ -327,25 +345,38 @@ func Process(ctx context.Context, c *Client, ts []Target, s State, init bool, no
 			return working, false, fmt.Errorf("%s: %w", t.Domain, e)
 		}
 	}
-	next := State{Version: 1, Domains: map[string]Cursor{}}
+	next := State{Version: 2, Domains: map[string]Cursor{}}
 	for k, v := range s.Domains {
 		next.Domains[k] = v
 	}
 	changed := batch.Initialize
-	message := "*CTログで新規証明書発行を検出しました*"
+	message := "*CTログで未確認の発行元による証明書発行を検出しました*"
+	alert := false
 	for _, t := range ts {
 		p := batch.Domains[t.Domain]
-		next.Domains[t.Domain] = Cursor{After: p.After, Subdomains: t.Subdomains}
+		issuers := append([]string{}, s.Domains[t.Domain].Issuers...)
+		known := map[string]bool{}
+		for _, issuer := range issuers {
+			known[issuer] = true
+		}
+		for _, v := range p.Items {
+			if !batch.Initialize && !known[v.Issuer.Name] {
+				message += Message(t, v)
+				alert = true
+			}
+		}
+		for _, v := range p.Items {
+			if !known[v.Issuer.Name] {
+				issuers = append(issuers, v.Issuer.Name)
+				known[v.Issuer.Name] = true
+			}
+		}
+		next.Domains[t.Domain] = Cursor{After: p.After, Subdomains: t.Subdomains, Issuers: issuers}
 		if len(p.Items) > 0 {
 			changed = true
 		}
-		if !batch.Initialize {
-			for _, v := range p.Items {
-				message += Message(t, v)
-			}
-		}
 	}
-	if !batch.Initialize && changed {
+	if alert {
 		if len([]rune(message)) > 35000 {
 			return working, false, errors.New("CT Slack message exceeds safe size; no cursor saved")
 		}
