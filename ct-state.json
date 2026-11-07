@@ -1,12 +1,18 @@
 {
-  "version": 1,
+  "version": 2,
   "domains": {
     "catatsuy.org": {
       "after": "18216987879",
+      "issuers": [
+        "Let's Encrypt"
+      ],
       "include_subdomains": true
     },
     "matw.co": {
       "after": "18217026677",
+      "issuers": [
+        "Let's Encrypt"
+      ],
       "include_subdomains": true
     }
   }
