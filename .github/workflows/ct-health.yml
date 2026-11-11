@@ -7,7 +7,7 @@ permissions:
   actions: read
 jobs:
   health:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Require a successful CT acquisition in the last 24 hours
